@@ -16,7 +16,7 @@
 #include "dac.h"
 
 #include "init_common.h"
-#include "conf_tc_irq.h"
+#include "interrupts.h"
 
 // this
 #include "main.h"
@@ -1221,7 +1221,7 @@ static bool arp_seq_switch_active(void) {
 	bool switched = false;
 
 	// disable timer interrupts
-	timers_pause();
+	u8 flags = irqs_pause();
 
 	if (next_seq->state == eSeqWaiting) {
 		next_seq->state = eSeqPlaying;
@@ -1233,7 +1233,7 @@ static bool arp_seq_switch_active(void) {
 	}
 
 	// enable timer interrupts
-	timers_resume();
+	irqs_resume(flags);
 
 	return switched;
 }
