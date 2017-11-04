@@ -22,6 +22,9 @@
 #include "main.h"
 #include "ansible_midi.h"
 
+#ifndef DEBUG_MPE_MODE
+#define DEBUG_MPE_MODE 1
+#endif
 
 #define MONO_PITCH_CV 0
 #define MONO_VELOCITY_CV 1
@@ -36,6 +39,17 @@
 
 //------------------------------
 //------ types
+typedef struct {
+	u8 num;           // note num
+	u8 vel;           // velocity, release velocity if released == true
+	u8 pressure;      // channel pressure
+	u8 brightness;    // cc: brightness (front-back)
+	u16 bend;         // pitch bend
+  s16 pitch_offset;
+	u8 active : 1;    // is currently focused touch
+	u8 released : 1;  // note off occured
+} mpe_touch_t;
+
 
 typedef struct {
 	u8 learning : 1;
@@ -76,6 +90,11 @@ static void set_voice_tune(voicing_mode v, s16 shift);
 
 static void reset(void);
 
+static void aux0_callback(void *obj);
+static void aux1_callback(void *obj);
+
+static void aux_null(void);
+
 static void poly_note_on(u8 ch, u8 num, u8 vel);
 static void poly_note_off(u8 ch, u8 num, u8 vel);
 static void poly_pitch_bend(u8 ch, u16 bend);
@@ -111,6 +130,16 @@ static bool fixed_finalize_learning(bool cancel);
 static void fixed_note_on(u8 ch, u8 num, u8 vel);
 static void fixed_note_off(u8 ch, u8 num, u8 vel);
 static void fixed_control_change(u8 ch, u8 num, u8 val);
+
+static void mpe_note_on(u8 ch, u8 num, u8 vel);
+static void mpe_note_off(u8 ch, u8 num, u8 vel);
+static void mpe_pitch_bend(u8 ch, u16 bend);
+static void mpe_sustain(u8 ch, u8 val);
+static void mpe_channel_pressure(u8 ch, u8 val);
+static void mpe_control_change(u8 ch, u8 num, u8 val);
+static void mpe_panic(void);
+static void mpe_release(void);
+static void mpe_focus(void);
 
 static void restore_midi_arp(void);
 
@@ -215,6 +244,14 @@ static note_pool_t notes[4];
 static voice_flags_t flags[4];
 static voice_state_t voice_state;
 
+// mpe working state
+static u8 mpe_focus_ch = 0;
+static u8 mpe_z1_ch = 0;
+static u8 mpe_z2_ch = 0;
+static mpe_touch_t touches[16];
+static s8 mpe_release_tr_ticks = -1;
+static s8 mpe_focus_tr_ticks = -1;
+
 // arp mode working state
 static chord_t chord;
 static u8 chord_held_notes;
@@ -230,6 +267,9 @@ static midi_clock_t midi_clock;
 static key_state_t key_state;
 static clock_source sync_source;
 
+static void (*aux0)(void);
+static void (*aux1)(void);
+
 void set_mode_midi(void) {
 	switch(ansible_mode) {
 	case mMidiStandard:
@@ -240,6 +280,10 @@ void set_mode_midi(void) {
 		app_event_handlers[kEventTrNormal] = &handler_StandardTrNormal;
 		app_event_handlers[kEventMidiPacket] = &handler_StandardMidiPacket;
 		restore_midi_standard();
+		timer_remove(&auxTimer[0]);
+		timer_add(&auxTimer[0], 10, &aux0_callback, NULL);
+		timer_remove(&auxTimer[1]);
+		timer_add(&auxTimer[1], 10, &aux1_callback, NULL);
 		init_i2c_slave(II_MID_ADDR);
 		process_ii = &ii_midi_standard;
 		update_leds(1);
@@ -371,11 +415,29 @@ static void reset(void) {
 		pitch_offset[i] = 0;
 		dac_set_value_noslew(i, 0);
 	}
+	for (int i = 0; i < 16; i++) {
+		touches[i].active = false;
+		touches[i].released = true;
+	}
+	mpe_release_tr_ticks = -1;
 	dac_update_now();
 	clr_tr(TR1);
 	clr_tr(TR2);
 	clr_tr(TR3);
 	clr_tr(TR4);
+}
+
+static void aux0_callback(void *obj) {
+  // call mode specific refresh function
+  (*aux0)();
+}
+
+static void aux1_callback(void *obj) {
+  // TODO: clean up this duplication
+  (*aux1)();
+}
+
+static void aux_null(void) {
 }
 
 static void set_voice_allocation(voicing_mode v) {
@@ -396,6 +458,8 @@ static void set_voice_allocation(voicing_mode v) {
 		active_behavior.panic = &poly_panic;
 		voice_slot_init(&voice_state, kVoiceAllocRotate, 4); // TODO: count configurable?
 		clock = &clock_null;
+		aux0 = &aux_null;
+		aux1 = &aux_null;
 		print_dbg("\r\n standard: voice poly");
 		break;
 	case eVoiceMono:
@@ -410,6 +474,8 @@ static void set_voice_allocation(voicing_mode v) {
 		active_behavior.seq_continue = &mono_rt_continue;
 		active_behavior.panic = &mono_panic;
 		clock = &clock_null;
+		aux0 = &aux_null;
+		aux1 = &aux_null;
 		flags[0].legato = 1;
 		mono_pitch_bend(0, MIDI_BEND_ZERO);
 		print_dbg("\r\n standard: voice mono");
@@ -426,6 +492,8 @@ static void set_voice_allocation(voicing_mode v) {
 		active_behavior.seq_continue = NULL;
 		active_behavior.panic = &reset;
 		clock = &clock_null;
+		aux0 = &aux_null;
+		aux1 = &aux_null;
 		flags[0].legato = flags[1].legato = flags[2].legato = flags[3].legato = 1;
 		print_dbg("\r\n standard: voice multi");
 		break;
@@ -441,7 +509,25 @@ static void set_voice_allocation(voicing_mode v) {
 		active_behavior.seq_continue = NULL;
 		active_behavior.panic = &reset;
 		clock = &clock_null;
+		aux0 = &aux_null;
+		aux1 = &aux_null;
 		print_dbg("\r\n standard: voice fixed");
+		break;
+	case eVoiceMPE:
+		active_behavior.note_on = &mpe_note_on;
+		active_behavior.note_off = &mpe_note_off;
+		active_behavior.channel_pressure = &mpe_channel_pressure;
+		active_behavior.pitch_bend = &mpe_pitch_bend;
+		active_behavior.control_change = &mpe_control_change;
+		active_behavior.clock_tick = NULL;
+		active_behavior.seq_start = NULL;
+		active_behavior.seq_stop = NULL;
+		active_behavior.seq_continue = NULL;
+		active_behavior.panic = &mpe_panic;
+		clock = &clock_null;
+		aux0 = &mpe_release;
+		aux1 = &mpe_focus;
+		print_dbg("\r\n standard: voice mpe");
 		break;
 	default:
 		print_dbg("\r\n standard: bad voice mode");
@@ -463,6 +549,9 @@ static void set_voice_slew(voicing_mode v, s16 slew) {
 		dac_set_slew(1, 0);     // velocity
 		dac_set_slew(2, 5);     // channel pressure
 		dac_set_slew(3, 5);     // mod
+		break;
+	case eVoiceMPE:
+		// TODO: 
 		break;
 	default:
 		for (i = 0; i < 4; i++) {
@@ -487,6 +576,9 @@ static void set_voice_tune(voicing_mode v, s16 shift) {
 		dac_set_off(1, 0);      // velocity
 		dac_set_off(2, 0);      // channel pressure
 		dac_set_off(3, 0);      // mod
+		break;
+	case eVoiceMPE:
+		// TODO:
 		break;
 	default:
 		for (i = 0; i < 4; i++) {
@@ -1148,6 +1240,182 @@ static void fixed_control_change(u8 ch, u8 num, u8 val) {
 		}
 	}
 }
+
+
+////////////////////////////////////////////////////////////////////////////////
+///// mpe behavior (standard)
+
+static void mpe_note_on(u8 ch, u8 num, u8 vel) {
+  if (num > MIDI_NOTE_MAX)
+    return;
+
+  // keep track of held notes for legato and pitch bend
+  touches[ch].num = num;
+  touches[ch].vel = vel;
+  touches[ch].released = false;
+  touches[ch].pitch_offset = 0; // MAINT: assuming bend message follows note on
+  mpe_focus_ch = ch;
+	
+  dac_set_value(MONO_PITCH_CV, pitch_cv(num, 0));
+  dac_set_value_noslew(MONO_VELOCITY_CV, velocity_cv(vel));
+  dac_update_now();
+  set_tr(TR1);
+
+#if DEBUG_MPE_MODE
+  print_dbg("\r\n mpe note on: ch; ");
+  print_dbg_ulong(ch);
+  print_dbg(" num: ");
+  print_dbg_ulong(num);
+#endif
+}
+
+static void mpe_note_off(u8 ch, u8 num, u8 vel) {
+  if (touches[ch].num != num) {
+    // this should never happen, but if the controller isn't in mpe mode
+    print_dbg("\r\n mpe_note_off: bad num; ");
+    print_dbg_ulong(num);
+    print_dbg(" expected ");
+    print_dbg_ulong(touches[ch].num);
+  }
+
+  touches[ch].released = true;
+  touches[ch].vel = vel;     // release velocity
+
+#if DEBUG_MPE_MODE
+  print_dbg("\r\n mpe note off: ch; ");
+  print_dbg_ulong(ch);
+  print_dbg(" num: ");
+  print_dbg_ulong(num);
+#endif
+
+  if (ch == mpe_focus_ch) {
+    // gate low
+    touches[ch].active = false;
+    clr_tr(TR1);
+
+    // release trig
+    set_tr(TR2);
+    mpe_release_tr_ticks = 10;
+    timer_reset(&auxTimer[0]);
+
+    // zero out pressure
+    dac_set_value_noslew(MONO_PRESSURE_CV, cc_cv(0));
+    dac_update_now();
+    
+#if DEBUG_MPE_MODE
+    print_dbg(" active; clr TR1");
+#endif
+  }
+}
+
+static void mpe_pitch_bend(u8 ch, u16 bend) {
+  // MAINT: assuming bend is always 14 bit...
+  if (bend == MIDI_BEND_ZERO) {
+    touches[ch].pitch_offset = 0;
+  }
+  else if (bend > MIDI_BEND_ZERO) {
+    bend -= MIDI_BEND_ZERO;
+    touches[ch].pitch_offset = BEND1_14[bend >> 4];
+  }
+  else {
+    bend = MIDI_BEND_ZERO - bend - 1;
+    touches[ch].pitch_offset = -BEND1_14[bend >> 4];
+  }
+
+  if (ch == mpe_focus_ch) {
+    dac_set_value(MONO_PITCH_CV, pitch_cv(touches[ch].num, touches[ch].pitch_offset));
+    dac_update_now();
+  }
+}
+
+static void mpe_sustain(u8 ch, u8 val) {
+}
+
+static void mpe_channel_pressure(u8 ch, u8 val) {
+  u8 z1;
+  
+  touches[ch].pressure = val;
+
+  // find max pressure
+  z1 = mpe_z1_ch;
+  for (u8 i = 1; i < 16; i++) {
+    if (!touches[i].released && touches[i].pressure > touches[mpe_z1_ch].pressure) {
+      z1 = i;
+    }
+  }
+  if (z1 != mpe_z1_ch) {
+    // new highest z
+    mpe_z2_ch = mpe_z1_ch;
+    mpe_z1_ch = z1;
+  
+#if DEBUG_MPE_MODE
+    print_dbg("\r\n mpe max ch: ");
+    print_dbg_ulong(mpe_z2_ch);
+    print_dbg(" -> ");
+    print_dbg_ulong(mpe_z1_ch);
+#endif
+
+    // MAINT: does this make sense? ..which ever touch has the highest
+    // pressure takes over focus so the release trigger, pitch
+    // (+bend), and brightness values follow?
+    mpe_focus_ch = mpe_z1_ch;
+    
+    // TODO: make propotional to pressure difference?
+    dac_set_value(MONO_PITCH_CV, pitch_cv(touches[mpe_focus_ch].num,
+					  touches[mpe_focus_ch].pitch_offset));
+    dac_set_value(MONO_MOD_CV, cc_cv(touches[mpe_focus_ch].brightness));
+    dac_update_now();
+
+    // TODO: make TR3 trigger on focus change?
+    set_tr(TR3);
+    mpe_focus_tr_ticks = 10;
+    timer_reset(&auxTimer[1]);
+  }
+	
+  if (ch == mpe_focus_ch) {
+    dac_set_value_noslew(MONO_PRESSURE_CV, cc_cv(val));
+    dac_update_now();
+  }
+}
+
+static void mpe_control_change(u8 ch, u8 num, u8 val) {
+  switch (num) {
+  case 0x4a:   // brightness
+    touches[ch].brightness = val;
+    if (ch == mpe_focus_ch) {
+      dac_set_value_noslew(MONO_MOD_CV, cc_cv(val));
+      dac_update_now();
+    }
+    break;
+  default:
+    break;
+  }
+}
+
+static void mpe_panic(void) {
+}
+
+static void mpe_release(void) {
+  // handle release tr
+  if (mpe_release_tr_ticks >= 0) {
+    mpe_release_tr_ticks -= auxTimer[0].ticks;
+    if (mpe_release_tr_ticks <= 0) {
+      clr_tr(TR2);
+    }
+  }
+}
+
+static void mpe_focus(void) {
+  // handle focus tr
+  if (mpe_focus_tr_ticks >= 0) {
+    mpe_focus_tr_ticks -= auxTimer[1].ticks;
+    if (mpe_focus_tr_ticks <= 0) {
+      clr_tr(TR3);
+    }
+  }
+}
+
+
 
 
 
