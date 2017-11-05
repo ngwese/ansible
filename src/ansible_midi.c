@@ -42,7 +42,7 @@
 typedef struct {
 	u8 num;           // note num
 	u8 vel;           // velocity, release velocity if released == true
-	u8 pressure;      // channel pressure
+	u8 pressure[3];   // channel pressure
 	u8 brightness;    // cc: brightness (front-back)
 	u16 bend;         // pitch bend
   s16 pitch_offset;
@@ -89,6 +89,7 @@ static void set_voice_slew(voicing_mode v, s16 slew);
 static void set_voice_tune(voicing_mode v, s16 shift);
 
 static void reset(void);
+static void led_flash(u8 count, u8 low, u8 high, u8 final, u8 delay);
 
 static void aux0_callback(void *obj);
 static void aux1_callback(void *obj);
@@ -131,6 +132,7 @@ static void fixed_note_on(u8 ch, u8 num, u8 vel);
 static void fixed_note_off(u8 ch, u8 num, u8 vel);
 static void fixed_control_change(u8 ch, u8 num, u8 val);
 
+static void mpe_touch_init(mpe_touch_t *t);
 static void mpe_note_on(u8 ch, u8 num, u8 vel);
 static void mpe_note_off(u8 ch, u8 num, u8 vel);
 static void mpe_pitch_bend(u8 ch, u16 bend);
@@ -354,6 +356,18 @@ void handler_MidiFrontShort(s32 data) {
 	}
 }
 
+static void led_flash(u8 count, u8 low, u8 high, u8 final, u8 delay) {
+  u8 s = low;
+  u16 steps = count * 2;
+  
+  for (u16 i = 0; i < steps; i++) {
+    update_leds(s);
+    delay_ms(delay);
+    s = s == low ? high : low;
+  }
+  update_leds(final);
+}
+
 void handler_MidiFrontLong(s32 data) {
 	if (key_state.key2) {
 		// panic sequence to reset standard/arp mode to defaults
@@ -415,11 +429,13 @@ static void reset(void) {
 		pitch_offset[i] = 0;
 		dac_set_value_noslew(i, 0);
 	}
+	
 	for (int i = 0; i < 16; i++) {
-		touches[i].active = false;
-		touches[i].released = true;
+	  mpe_touch_init(&(touches[i]));
 	}
 	mpe_release_tr_ticks = -1;
+	mpe_focus_tr_ticks = -1;
+	
 	dac_update_now();
 	clr_tr(TR1);
 	clr_tr(TR2);
@@ -461,6 +477,7 @@ static void set_voice_allocation(voicing_mode v) {
 		aux0 = &aux_null;
 		aux1 = &aux_null;
 		print_dbg("\r\n standard: voice poly");
+		//led_flash(1, 2, 1, 50);
 		break;
 	case eVoiceMono:
 		active_behavior.note_on = &mono_note_on;
@@ -479,6 +496,7 @@ static void set_voice_allocation(voicing_mode v) {
 		flags[0].legato = 1;
 		mono_pitch_bend(0, MIDI_BEND_ZERO);
 		print_dbg("\r\n standard: voice mono");
+		//led_flash(2, 2, 1, 50);
 		break;
 	case eVoiceMulti:
 		active_behavior.note_on = &multi_note_on;
@@ -496,6 +514,7 @@ static void set_voice_allocation(voicing_mode v) {
 		aux1 = &aux_null;
 		flags[0].legato = flags[1].legato = flags[2].legato = flags[3].legato = 1;
 		print_dbg("\r\n standard: voice multi");
+		//led_flash(3, 2, 1, 50);
 		break;
 	case eVoiceFixed:
 		active_behavior.note_on = &fixed_note_on;
@@ -512,6 +531,7 @@ static void set_voice_allocation(voicing_mode v) {
 		aux0 = &aux_null;
 		aux1 = &aux_null;
 		print_dbg("\r\n standard: voice fixed");
+		//led_flash(4, 2, 1, 50);
 		break;
 	case eVoiceMPE:
 		active_behavior.note_on = &mpe_note_on;
@@ -528,10 +548,12 @@ static void set_voice_allocation(voicing_mode v) {
 		aux0 = &mpe_release;
 		aux1 = &mpe_focus;
 		print_dbg("\r\n standard: voice mpe");
+		led_flash(2, 2, 1, 1, 50);
 		break;
 	default:
 		print_dbg("\r\n standard: bad voice mode");
 	}
+
 }
 
 static void set_voice_slew(voicing_mode v, s16 slew) {
@@ -1245,6 +1267,30 @@ static void fixed_control_change(u8 ch, u8 num, u8 val) {
 ////////////////////////////////////////////////////////////////////////////////
 ///// mpe behavior (standard)
 
+static void mpe_touch_init(mpe_touch_t *t) {
+  t->num = 0;
+  t->vel = 0;
+  t->pressure[0] = t->pressure[1] = t->pressure[2] = 0;
+  t->brightness = 0;
+  t->bend = 0;
+  t->pitch_offset = 0;
+  t->active = false;
+  t->released = true;
+}
+
+static void mpe_touch_set_pressure(mpe_touch_t *t, u8 p) {
+  t->pressure[2] = t->pressure[1];
+  t->pressure[1] = t->pressure[0];
+  t->pressure[0] = p;
+}
+
+static void mpe_touch_set_fpressure(mpe_touch_t *t, u8 p) {
+  u16 fp = p;
+  fp += t->pressure[2] = t->pressure[1];
+  fp += t->pressure[1] = t->pressure[0];
+  t->pressure[0] = fp / 3;
+}
+
 static void mpe_note_on(u8 ch, u8 num, u8 vel) {
   if (num > MIDI_NOTE_MAX)
     return;
@@ -1306,6 +1352,13 @@ static void mpe_note_off(u8 ch, u8 num, u8 vel) {
     print_dbg(" active; clr TR1");
 #endif
   }
+
+  if (ch == mpe_z2_ch) {
+    mpe_z2_ch = 0;
+#if DEBUG_MPE_MODE
+    print_dbg("; clr z2");
+#endif
+  }    
 }
 
 static void mpe_pitch_bend(u8 ch, u16 bend) {
@@ -1334,47 +1387,76 @@ static void mpe_sustain(u8 ch, u8 val) {
 static void mpe_channel_pressure(u8 ch, u8 val) {
   u8 z1;
   
-  touches[ch].pressure = val;
+  //touches[ch].pressure = val;
+  mpe_touch_set_fpressure(&(touches[ch]), val);
 
   // find max pressure
   z1 = mpe_z1_ch;
   for (u8 i = 1; i < 16; i++) {
-    if (!touches[i].released && touches[i].pressure > touches[mpe_z1_ch].pressure) {
+    if (!touches[i].released && touches[i].pressure[0] > touches[mpe_z1_ch].pressure[0]) {
       z1 = i;
     }
   }
+  
   if (z1 != mpe_z1_ch) {
     // new highest z
     mpe_z2_ch = mpe_z1_ch;
     mpe_z1_ch = z1;
   
+    // MAINT: does this make sense? ..which ever touch has the highest
+    // pressure takes over focus so the release trigger, pitch
+    // (+bend), and brightness values follow?
+    mpe_focus_ch = mpe_z1_ch;
+  }
+
+  if (mpe_z2_ch == 0) {
+    // single touch
+    dac_set_value(MONO_PITCH_CV,
+		  pitch_cv(touches[mpe_focus_ch].num, touches[mpe_focus_ch].pitch_offset));
+    dac_set_value(MONO_MOD_CV,
+		  cc_cv(touches[mpe_focus_ch].brightness));
+    dac_set_value_noslew(MONO_PRESSURE_CV,
+			 cc_cv(touches[mpe_focus_ch].pressure[0]));
+  }
+  else {
+    // multiple touch, blend
+    float high_p = touches[mpe_focus_ch].pressure[0];
+    float total_p = high_p + touches[mpe_z2_ch].pressure[0];
+    float percent = high_p / total_p;
+    float percent_inv = 1 - percent;
+
 #if DEBUG_MPE_MODE
     print_dbg("\r\n mpe max ch: ");
     print_dbg_ulong(mpe_z2_ch);
     print_dbg(" -> ");
     print_dbg_ulong(mpe_z1_ch);
+    print_dbg(" z1% ");
+    print_dbg_ulong((u8)(percent * 100));
+    print_dbg(" / ");
+    print_dbg_ulong((u8)(percent_inv * 100));
 #endif
 
-    // MAINT: does this make sense? ..which ever touch has the highest
-    // pressure takes over focus so the release trigger, pitch
-    // (+bend), and brightness values follow?
-    mpe_focus_ch = mpe_z1_ch;
-    
-    // TODO: make propotional to pressure difference?
-    dac_set_value(MONO_PITCH_CV, pitch_cv(touches[mpe_focus_ch].num,
-					  touches[mpe_focus_ch].pitch_offset));
-    dac_set_value(MONO_MOD_CV, cc_cv(touches[mpe_focus_ch].brightness));
+    uint16_t pitch_to = pitch_cv(touches[mpe_focus_ch].num, touches[mpe_focus_ch].pitch_offset);
+    uint16_t pitch_from = pitch_cv(touches[mpe_z2_ch].num, touches[mpe_z2_ch].pitch_offset);
+    uint16_t pitch = (pitch_to * percent) + (pitch_from * percent_inv);
+    dac_set_value(MONO_PITCH_CV, pitch);
+					
+    uint16_t bright_to = cc_cv(touches[mpe_focus_ch].brightness);
+    uint16_t bright_from = cc_cv(touches[mpe_z2_ch].brightness);
+    uint16_t bright = (bright_to * percent) + (bright_from * percent_inv);
+    dac_set_value(MONO_MOD_CV, bright);
+
+    uint16_t press_to = cc_cv(touches[mpe_focus_ch].pressure[0]);
+    uint16_t press_from = cc_cv(touches[mpe_z2_ch].pressure[0]);
+    uint16_t press = (press_to * percent) + (press_from * percent_inv);
+    dac_set_value_noslew(MONO_PRESSURE_CV, press);
+
     dac_update_now();
 
     // TODO: make TR3 trigger on focus change?
     set_tr(TR3);
     mpe_focus_tr_ticks = 10;
     timer_reset(&auxTimer[1]);
-  }
-	
-  if (ch == mpe_focus_ch) {
-    dac_set_value_noslew(MONO_PRESSURE_CV, cc_cv(val));
-    dac_update_now();
   }
 }
 
@@ -1393,6 +1475,7 @@ static void mpe_control_change(u8 ch, u8 num, u8 val) {
 }
 
 static void mpe_panic(void) {
+  reset();
 }
 
 static void mpe_release(void) {
