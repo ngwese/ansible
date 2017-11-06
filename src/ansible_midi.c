@@ -40,16 +40,21 @@
 //------------------------------
 //------ types
 typedef struct {
-	u8 num;           // note num
-	u8 vel;           // velocity, release velocity if released == true
-	u8 pressure[3];   // channel pressure
-	u8 brightness;    // cc: brightness (front-back)
-	u16 bend;         // pitch bend
+  u8 num;                 // note num
+  u8 vel;                 // velocity,
+  u8 rvel;                // release velocity
+  u8 pressure[3];         // channel pressure; 3 values for averaging
+  u8 brightness;          // cc: brightness (front-back)
+  u16 bend;               // pitch bend
   s16 pitch_offset;
-	u8 active : 1;    // is currently focused touch
-	u8 released : 1;  // note off occured
+  u8 active : 1;          // if touch is currently held
 } mpe_touch_t;
 
+typedef struct {
+  mpe_touch_t touches[16];
+  u8 focus;               // focused touch channel; 0 == no focus
+  u8 z2;                  // 2nd highest z channel; 0 == no channel
+} mpe_tracker_t;
 
 typedef struct {
 	u8 learning : 1;
@@ -132,7 +137,17 @@ static void fixed_note_on(u8 ch, u8 num, u8 vel);
 static void fixed_note_off(u8 ch, u8 num, u8 vel);
 static void fixed_control_change(u8 ch, u8 num, u8 val);
 
+
+static void mpe_tracker_init(mpe_tracker_t *t);
+static bool mpe_tracker_set_focus(mpe_tracker_t *t);
+static void mpe_tracker_set_dacs(mpe_tracker_t *t, u8 ch);
+
 static void mpe_touch_init(mpe_touch_t *t);
+static void mpe_touch_clr_pressure(mpe_touch_t *t);
+static void mpe_touch_set_pressure(mpe_touch_t *t, u8 p);
+static void mpe_touch_set_fpressure(mpe_touch_t *t, u8 p);  // averaged
+static u8 mpe_touch_get_pressure(mpe_touch_t *t);
+
 static void mpe_note_on(u8 ch, u8 num, u8 vel);
 static void mpe_note_off(u8 ch, u8 num, u8 vel);
 static void mpe_pitch_bend(u8 ch, u16 bend);
@@ -247,12 +262,13 @@ static voice_flags_t flags[4];
 static voice_state_t voice_state;
 
 // mpe working state
-static u8 mpe_focus_ch = 0;
-static u8 mpe_z1_ch = 0;
-static u8 mpe_z2_ch = 0;
-static mpe_touch_t touches[16];
+//static u8 mpe_focus_ch = 0;
+//static u8 mpe_z1_ch = 0;
+//static u8 mpe_z2_ch = 0;
+//static mpe_touch_t touches[16];
 static s8 mpe_release_tr_ticks = -1;
 static s8 mpe_focus_tr_ticks = -1;
+static mpe_tracker_t mpe;
 
 // arp mode working state
 static chord_t chord;
@@ -430,9 +446,7 @@ static void reset(void) {
 		dac_set_value_noslew(i, 0);
 	}
 	
-	for (int i = 0; i < 16; i++) {
-	  mpe_touch_init(&(touches[i]));
-	}
+	mpe_tracker_init(&mpe);
 	mpe_release_tr_ticks = -1;
 	mpe_focus_tr_ticks = -1;
 	
@@ -573,7 +587,10 @@ static void set_voice_slew(voicing_mode v, s16 slew) {
 		dac_set_slew(3, 5);     // mod
 		break;
 	case eVoiceMPE:
-		// TODO: 
+	  dac_set_slew(0, slew);
+	  dac_set_slew(1, 0);     // velocity
+	  dac_set_slew(2, 5);     // channel pressure
+	  dac_set_slew(3, 5);     // mod
 		break;
 	default:
 		for (i = 0; i < 4; i++) {
@@ -1270,14 +1287,28 @@ static void fixed_control_change(u8 ch, u8 num, u8 val) {
 static void mpe_touch_init(mpe_touch_t *t) {
   t->num = 0;
   t->vel = 0;
-  t->pressure[0] = t->pressure[1] = t->pressure[2] = 0;
+  t->rvel = 0;
+
+  mpe_touch_clr_pressure(t);
+  
   t->brightness = 0;
   t->bend = 0;
   t->pitch_offset = 0;
   t->active = false;
-  t->released = true;
 }
 
+static void mpe_tracker_init(mpe_tracker_t *t) {
+  t->focus = 0;
+  t->z2 = 0;
+  for (u8 i = 0; i < 16; i++) {
+    mpe_touch_init(&(t->touches[i]));
+  }
+}
+
+static void mpe_touch_clr_pressure(mpe_touch_t *t) {
+  t->pressure[0] = t->pressure[1] = t->pressure[2] = 0;
+}
+  
 static void mpe_touch_set_pressure(mpe_touch_t *t, u8 p) {
   t->pressure[2] = t->pressure[1];
   t->pressure[1] = t->pressure[0];
@@ -1291,41 +1322,63 @@ static void mpe_touch_set_fpressure(mpe_touch_t *t, u8 p) {
   t->pressure[0] = fp / 3;
 }
 
+static u8 mpe_touch_get_pressure(mpe_touch_t *t) {
+  return t->pressure[0];
+}
+
 static void mpe_note_on(u8 ch, u8 num, u8 vel) {
   if (num > MIDI_NOTE_MAX)
     return;
 
   // keep track of held notes for legato and pitch bend
-  touches[ch].num = num;
-  touches[ch].vel = vel;
-  touches[ch].released = false;
-  touches[ch].pitch_offset = 0; // MAINT: assuming bend message follows note on
-  mpe_focus_ch = ch;
+  mpe.touches[ch].num = num;
+  mpe.touches[ch].vel = vel;
+  mpe.touches[ch].rvel = 0;
+  mpe.touches[ch].pitch_offset = 0; // MAINT: assuming bend message follows note on
+  mpe.touches[ch].active = true;
+  mpe_touch_clr_pressure(&(mpe.touches[ch]));
+
+  if (mpe.focus == 0) {
+    // no other note/touch is focused, take focus and immediate set the outputs we know
+    mpe.focus = ch;
 	
-  dac_set_value(MONO_PITCH_CV, pitch_cv(num, 0));
-  dac_set_value_noslew(MONO_VELOCITY_CV, velocity_cv(vel));
-  dac_update_now();
-  set_tr(TR1);
+    dac_set_value(MONO_PITCH_CV, pitch_cv(num, 0));
+    dac_set_value_noslew(MONO_VELOCITY_CV, velocity_cv(vel));
+    dac_update_now();
+    set_tr(TR1);
 
 #if DEBUG_MPE_MODE
-  print_dbg("\r\n mpe note on: ch; ");
-  print_dbg_ulong(ch);
-  print_dbg(" num: ");
-  print_dbg_ulong(num);
+    print_dbg("\r\n mpe note on: ch; ");
+    print_dbg_ulong(ch);
+    print_dbg(" num: ");
+    print_dbg_ulong(num);
 #endif
+  }
+  else {
+    // some other note has focus, record values and wait for pressure
+    // event to determine if this new note should steal focus from
+    // existing note.
+#if DEBUG_MPE_MODE
+    print_dbg("\r\n mpe note on: ch; ");
+    print_dbg_ulong(ch);
+    print_dbg(" [not focus]");
+#endif
+  }    
 }
 
 static void mpe_note_off(u8 ch, u8 num, u8 vel) {
-  if (touches[ch].num != num) {
+  bool dac_dirty = false;
+  
+  if (mpe.touches[ch].num != num) {
     // this should never happen, but if the controller isn't in mpe mode
     print_dbg("\r\n mpe_note_off: bad num; ");
     print_dbg_ulong(num);
     print_dbg(" expected ");
-    print_dbg_ulong(touches[ch].num);
+    print_dbg_ulong(mpe.touches[ch].num);
   }
 
-  touches[ch].released = true;
-  touches[ch].vel = vel;     // release velocity
+  mpe.touches[ch].active = false;
+  mpe.touches[ch].rvel = vel;     // release velocity
 
 #if DEBUG_MPE_MODE
   print_dbg("\r\n mpe note off: ch; ");
@@ -1334,9 +1387,11 @@ static void mpe_note_off(u8 ch, u8 num, u8 vel) {
   print_dbg_ulong(num);
 #endif
 
-  if (ch == mpe_focus_ch) {
+  if (ch == mpe.focus) {
+    mpe.focus = 0;
+    
     // gate low
-    touches[ch].active = false;
+    mpe.touches[ch].active = false;
     clr_tr(TR1);
 
     // release trig
@@ -1346,113 +1401,135 @@ static void mpe_note_off(u8 ch, u8 num, u8 vel) {
 
     // zero out pressure
     dac_set_value_noslew(MONO_PRESSURE_CV, cc_cv(0));
-    dac_update_now();
     
 #if DEBUG_MPE_MODE
-    print_dbg(" active; clr TR1");
+    print_dbg(" ; clr focus");
 #endif
+    dac_dirty = true;
   }
 
-  if (ch == mpe_z2_ch) {
-    mpe_z2_ch = 0;
+  if (ch == mpe.z2) {
+    mpe.z2 = 0;
 #if DEBUG_MPE_MODE
-    print_dbg("; clr z2");
+    print_dbg(" ; clr z2");
 #endif
-  }    
+    // ensure
+    mpe_tracker_set_dacs(&mpe, mpe.focus);
+    dac_dirty = true;
+  }
+
+  if (dac_dirty) {
+    dac_update_now();
+  }
 }
 
 static void mpe_pitch_bend(u8 ch, u16 bend) {
   // MAINT: assuming bend is always 14 bit...
   if (bend == MIDI_BEND_ZERO) {
-    touches[ch].pitch_offset = 0;
+    mpe.touches[ch].pitch_offset = 0;
   }
   else if (bend > MIDI_BEND_ZERO) {
     bend -= MIDI_BEND_ZERO;
-    touches[ch].pitch_offset = BEND1_14[bend >> 4];
+    mpe.touches[ch].pitch_offset = BEND1_14[bend >> 4];
   }
   else {
     bend = MIDI_BEND_ZERO - bend - 1;
-    touches[ch].pitch_offset = -BEND1_14[bend >> 4];
+    mpe.touches[ch].pitch_offset = -BEND1_14[bend >> 4];
   }
-
-  if (ch == mpe_focus_ch) {
-    dac_set_value(MONO_PITCH_CV, pitch_cv(touches[ch].num, touches[ch].pitch_offset));
+  
+  if (ch == mpe.focus || ch == mpe.z2) {
+    mpe_tracker_set_dacs(&mpe, ch);
     dac_update_now();
   }
 }
 
 static void mpe_sustain(u8 ch, u8 val) {
+  // TODO
 }
 
-static void mpe_channel_pressure(u8 ch, u8 val) {
-  u8 z1;
-  
-  //touches[ch].pressure = val;
-  mpe_touch_set_fpressure(&(touches[ch]), val);
-
-  // find max pressure
-  z1 = mpe_z1_ch;
-  for (u8 i = 1; i < 16; i++) {
-    if (!touches[i].released && touches[i].pressure[0] > touches[mpe_z1_ch].pressure[0]) {
-      z1 = i;
-    }
+static void mpe_tracker_set_dacs(mpe_tracker_t *t, u8 ch) {
+  if (ch == t->focus && t->z2 == 0) {
+    // this is for the one and only focused touch, set pressure 
+    dac_set_value(MONO_PRESSURE_CV, pitch_cv(t->touches[ch].num,
+					     t->touches[ch].pitch_offset));
+    dac_set_value(MONO_MOD_CV, cc_cv(t->touches[ch].brightness));
+    dac_set_value(MONO_PRESSURE_CV, cc_cv(mpe_touch_get_pressure(&(t->touches[ch]))));
   }
-  
-  if (z1 != mpe_z1_ch) {
-    // new highest z
-    mpe_z2_ch = mpe_z1_ch;
-    mpe_z1_ch = z1;
-  
-    // MAINT: does this make sense? ..which ever touch has the highest
-    // pressure takes over focus so the release trigger, pitch
-    // (+bend), and brightness values follow?
-    mpe_focus_ch = mpe_z1_ch;
-  }
-
-  if (mpe_z2_ch == 0) {
-    // single touch
-    dac_set_value(MONO_PITCH_CV,
-		  pitch_cv(touches[mpe_focus_ch].num, touches[mpe_focus_ch].pitch_offset));
-    dac_set_value(MONO_MOD_CV,
-		  cc_cv(touches[mpe_focus_ch].brightness));
-    dac_set_value_noslew(MONO_PRESSURE_CV,
-			 cc_cv(touches[mpe_focus_ch].pressure[0]));
-  }
-  else {
-    // multiple touch, blend
-    float high_p = touches[mpe_focus_ch].pressure[0];
-    float total_p = high_p + touches[mpe_z2_ch].pressure[0];
+  else if (ch == t->focus || ch == t->z2) {
+    // this effects the top two touches by pressure, blend
+    float high_p = mpe_touch_get_pressure(&(t->touches[t->focus]));
+    float total_p = high_p + mpe_touch_get_pressure(&(t->touches[t->z2]));
     float percent = high_p / total_p;
     float percent_inv = 1 - percent;
 
 #if DEBUG_MPE_MODE
     print_dbg("\r\n mpe max ch: ");
-    print_dbg_ulong(mpe_z2_ch);
+    print_dbg_ulong(t->z2);
     print_dbg(" -> ");
-    print_dbg_ulong(mpe_z1_ch);
+    print_dbg_ulong(t->focus);
     print_dbg(" z1% ");
-    print_dbg_ulong((u8)(percent * 100));
-    print_dbg(" / ");
     print_dbg_ulong((u8)(percent_inv * 100));
+    print_dbg(" / ");
+    print_dbg_ulong((u8)(percent * 100));
 #endif
 
-    uint16_t pitch_to = pitch_cv(touches[mpe_focus_ch].num, touches[mpe_focus_ch].pitch_offset);
-    uint16_t pitch_from = pitch_cv(touches[mpe_z2_ch].num, touches[mpe_z2_ch].pitch_offset);
+    uint16_t pitch_to = pitch_cv(t->touches[t->focus].num, t->touches[t->focus].pitch_offset);
+    uint16_t pitch_from = pitch_cv(t->touches[t->z2].num, t->touches[t->z2].pitch_offset);
     uint16_t pitch = (pitch_to * percent) + (pitch_from * percent_inv);
     dac_set_value(MONO_PITCH_CV, pitch);
 					
-    uint16_t bright_to = cc_cv(touches[mpe_focus_ch].brightness);
-    uint16_t bright_from = cc_cv(touches[mpe_z2_ch].brightness);
+    uint16_t bright_to = cc_cv(t->touches[t->focus].brightness);
+    uint16_t bright_from = cc_cv(t->touches[t->z2].brightness);
     uint16_t bright = (bright_to * percent) + (bright_from * percent_inv);
     dac_set_value(MONO_MOD_CV, bright);
 
-    uint16_t press_to = cc_cv(touches[mpe_focus_ch].pressure[0]);
-    uint16_t press_from = cc_cv(touches[mpe_z2_ch].pressure[0]);
+    // TODO: eliminate multiple function calls
+    uint16_t press_to = cc_cv(mpe_touch_get_pressure(&(t->touches[t->focus])));
+    uint16_t press_from = cc_cv(mpe_touch_get_pressure(&(t->touches[t->z2])));
     uint16_t press = (press_to * percent) + (press_from * percent_inv);
-    dac_set_value_noslew(MONO_PRESSURE_CV, press);
+    dac_set_value(MONO_PRESSURE_CV, press);
+  }
+}
 
-    dac_update_now();
+static bool mpe_tracker_set_focus(mpe_tracker_t *t) {
+  // FIXME: this should take an mpe_tracker_t*
+  // find top two touches by pressure
+  bool changed = false;
+  u8 z1 = t->focus;
+  u8 z2 = 0;
+  u8 p1 = mpe_touch_get_pressure(&(t->touches[t->focus]));
+  u8 p2 = mpe_touch_get_pressure(&(t->touches[t->z2]));
+  
+  for (u8 i = 1; i < 16; i++) {
+    if (t->touches[i].active) {
+      u8 pi = mpe_touch_get_pressure(&(t->touches[i]));
+      if (pi > p1) {
+	z1 = i;
+	changed = true;
+      }
+      else if (pi > p2) {
+	p2 = pi;
+	z2 = i;
+	changed = true;
+      }
+    }
+  }
 
+  t->focus = z1;
+  t->z2 = z2;
+
+  return changed;
+}  
+
+static void mpe_channel_pressure(u8 ch, u8 val) {
+  bool focus_changed = false;
+  
+  mpe_touch_set_fpressure(&(mpe.touches[ch]), val);
+  focus_changed = mpe_tracker_set_focus(&mpe);
+  mpe_tracker_set_dacs(&mpe, ch);
+  dac_update_now();
+
+  if (focus_changed) {
     // TODO: make TR3 trigger on focus change?
     set_tr(TR3);
     mpe_focus_tr_ticks = 10;
@@ -1463,11 +1540,13 @@ static void mpe_channel_pressure(u8 ch, u8 val) {
 static void mpe_control_change(u8 ch, u8 num, u8 val) {
   switch (num) {
   case 0x4a:   // brightness
-    touches[ch].brightness = val;
-    if (ch == mpe_focus_ch) {
-      dac_set_value_noslew(MONO_MOD_CV, cc_cv(val));
-      dac_update_now();
-    }
+    mpe.touches[ch].brightness = val;
+    mpe_tracker_set_dacs(&mpe, ch);
+    dac_update_now();
+    /* if (ch == mpe.focus) { */
+    /*   dac_set_value_noslew(MONO_MOD_CV, cc_cv(val)); */
+    /*   dac_update_now(); */
+    /* } */
     break;
   default:
     break;
